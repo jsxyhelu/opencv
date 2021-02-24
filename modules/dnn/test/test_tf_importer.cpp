@@ -81,12 +81,12 @@ class Test_TensorFlow_layers : public DNNTestLayer
 {
 public:
     void runTensorFlowNet(const std::string& prefix, bool hasText = false,
-                          double l1 = 0.0, double lInf = 0.0, bool memoryLoad = false)
+                          double l1 = 0.0, double lInf = 0.0, bool memoryLoad = false, const std::string& groupPrefix = "")
     {
-        std::string netPath = path(prefix + "_net.pb");
-        std::string netConfig = (hasText ? path(prefix + "_net.pbtxt") : "");
+        std::string netPath = path(prefix + groupPrefix + "_net.pb");
+        std::string netConfig = (hasText ? path(prefix + groupPrefix + "_net.pbtxt") : "");
         std::string inpPath = path(prefix + "_in.npy");
-        std::string outPath = path(prefix + "_out.npy");
+        std::string outPath = path(prefix + groupPrefix + "_out.npy");
 
         cv::Mat input = blobFromNPY(inpPath);
         cv::Mat ref = blobFromNPY(outPath);
@@ -128,6 +128,13 @@ TEST_P(Test_TensorFlow_layers, reduce_mean)
     runTensorFlowNet("global_pool_by_axis");
 }
 
+TEST_P(Test_TensorFlow_layers, reduce_sum)
+{
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NN_BUILDER);
+    runTensorFlowNet("sum_pool_by_axis");
+}
+
 TEST_P(Test_TensorFlow_layers, conv_single_conv)
 {
     runTensorFlowNet("single_conv");
@@ -166,8 +173,6 @@ TEST_P(Test_TensorFlow_layers, Convolution3D)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NN_BUILDER);  // Only CPU on DLIE backend is supported
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH && target != DNN_TARGET_CPU)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH);  // Only CPU on DLIE backend is supported
-    if (target != DNN_TARGET_CPU)
-        throw SkipTestException("Only CPU is supported");
     runTensorFlowNet("conv3d");
 }
 
@@ -340,6 +345,11 @@ TEST_P(Test_TensorFlow_layers, pooling_reduce_mean)
     runTensorFlowNet("reduce_mean");  // an average pooling over all spatial dimensions.
 }
 
+TEST_P(Test_TensorFlow_layers, pooling_reduce_sum)
+{
+    runTensorFlowNet("reduce_sum");  // a SUM pooling over all spatial dimensions.
+}
+
 TEST_P(Test_TensorFlow_layers, max_pool_grad)
 {
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019)
@@ -453,6 +463,7 @@ TEST_P(Test_TensorFlow_layers, leaky_relu)
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 && target == DNN_TARGET_OPENCL)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_OPENCL, CV_TEST_TAG_DNN_SKIP_IE_NN_BUILDER, CV_TEST_TAG_DNN_SKIP_IE_VERSION);
 #endif
+    runTensorFlowNet("leaky_relu");
     runTensorFlowNet("leaky_relu_order1");
     runTensorFlowNet("leaky_relu_order2");
     runTensorFlowNet("leaky_relu_order3");
@@ -910,6 +921,19 @@ TEST_P(Test_TensorFlow_layers, resize_nearest_neighbor)
     runTensorFlowNet("keras_upsampling2d");
 }
 
+TEST_P(Test_TensorFlow_layers, resize_nearest_neighbor_align_corners)
+{
+    runTensorFlowNet("resize_nearest_neighbor", false, 0.0, 0.0, false, "_align_corners");
+}
+
+TEST_P(Test_TensorFlow_layers, resize_nearest_neighbor_half_pixel)
+{
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH);
+
+    runTensorFlowNet("resize_nearest_neighbor", false, 0.0, 0.0, false, "_half_pixel");
+}
+
 TEST_P(Test_TensorFlow_layers, fused_resize_conv)
 {
     runTensorFlowNet("fused_resize_conv");
@@ -965,10 +989,53 @@ TEST_P(Test_TensorFlow_layers, keras_mobilenet_head)
     runTensorFlowNet("keras_learning_phase");
 }
 
+// TF case: align_corners=False, half_pixel_centers=False
 TEST_P(Test_TensorFlow_layers, resize_bilinear)
 {
     runTensorFlowNet("resize_bilinear");
+}
+
+// TF case: align_corners=True, half_pixel_centers=False
+TEST_P(Test_TensorFlow_layers, resize_bilinear_align_corners)
+{
+    runTensorFlowNet("resize_bilinear",
+                     false, 0.0, 0.0, false, // default parameters
+                     "_align_corners");
+}
+
+// TF case: align_corners=False, half_pixel_centers=True
+TEST_P(Test_TensorFlow_layers, resize_bilinear_half_pixel)
+{
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH);
+
+    runTensorFlowNet("resize_bilinear", false, 0.0, 0.0, false, "_half_pixel");
+}
+
+// TF case: align_corners=False, half_pixel_centers=False
+TEST_P(Test_TensorFlow_layers, resize_bilinear_factor)
+{
     runTensorFlowNet("resize_bilinear_factor");
+}
+
+// TF case: align_corners=False, half_pixel_centers=True
+TEST_P(Test_TensorFlow_layers, resize_bilinear_factor_half_pixel)
+{
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH);
+
+    runTensorFlowNet("resize_bilinear_factor", false, 0.0, 0.0, false, "_half_pixel");
+}
+
+// TF case: align_corners=True, half_pixel_centers=False
+TEST_P(Test_TensorFlow_layers, resize_bilinear_factor_align_corners)
+{
+    runTensorFlowNet("resize_bilinear_factor", false, 0.0, 0.0, false, "_align_corners");
+}
+
+// TF case: align_corners=False, half_pixel_centers=False
+TEST_P(Test_TensorFlow_layers, resize_bilinear_down)
+{
     runTensorFlowNet("resize_bilinear_down");
 }
 

@@ -1119,6 +1119,7 @@ struct Net::Impl : public detail::NetImplBase
         preferableBackend = DNN_BACKEND_DEFAULT;
         preferableTarget = DNN_TARGET_CPU;
         skipInfEngineInit = false;
+        hasDynamicShapes = false;
     }
 
     Ptr<DataLayer> netInputLayer;
@@ -1130,6 +1131,7 @@ struct Net::Impl : public detail::NetImplBase
     int preferableTarget;
     String halideConfigFile;
     bool skipInfEngineInit;
+    bool hasDynamicShapes;
     // Map host data to backend specific wrapper.
     std::map<void*, Ptr<BackendWrapper> > backendWrappers;
 
@@ -2113,7 +2115,9 @@ struct Net::Impl : public detail::NetImplBase
 
                     auto ieInpNode = inputNodes[i].dynamicCast<InfEngineNgraphNode>();
                     CV_Assert(oid < ieInpNode->node->get_output_size());
-#if INF_ENGINE_VER_MAJOR_GT(INF_ENGINE_RELEASE_2020_3)
+#if INF_ENGINE_VER_MAJOR_GT(INF_ENGINE_RELEASE_2020_4)
+                    inputNodes[i] = Ptr<BackendNode>(new InfEngineNgraphNode(ieInpNode->node));
+#elif INF_ENGINE_VER_MAJOR_GT(INF_ENGINE_RELEASE_2020_3)
                     inputNodes[i] = Ptr<BackendNode>(new InfEngineNgraphNode(ieInpNode->node->get_output_as_single_output_node(oid)));
 #else
                     inputNodes[i] = Ptr<BackendNode>(new InfEngineNgraphNode(ieInpNode->node->get_output_as_single_output_node(oid, false)));
@@ -2411,14 +2415,42 @@ struct Net::Impl : public detail::NetImplBase
                 }
 
                 // fuse convolution layer followed by eltwise + relu
-                if ( IS_DNN_OPENCL_TARGET(preferableTarget) && ld.layerInstance->type == "Convolution" )
+                while (nextData && IS_DNN_OPENCL_TARGET(preferableTarget) && ld.layerInstance->type == "Convolution")  // semantic of 'if'
                 {
-                    Ptr<EltwiseLayer> nextEltwiseLayer;
-                    if( nextData )
-                        nextEltwiseLayer = nextData->layerInstance.dynamicCast<EltwiseLayer>();
+                    Ptr<EltwiseLayer> nextEltwiseLayer = nextData->layerInstance.dynamicCast<EltwiseLayer>();
+                    if (nextEltwiseLayer.empty())
+                        break;
 
-                    if( !nextEltwiseLayer.empty() && pinsToKeep.count(lpNext) == 0 &&
-                        nextData && nextData->inputBlobsId.size() == 2 )
+                    if (pinsToKeep.count(lpNext) != 0)
+                        break;
+                    if (nextData->inputBlobsId.size() != 2)
+                        break;
+
+                    if (!nextData->params.has("operation") || nextData->params.get<String>("operation").toLowerCase() == "sum")
+                    {
+                        if (nextData->params.has("coeff"))
+                        {
+                            DictValue paramCoeff = nextData->params.get("coeff");
+                            int n = paramCoeff.size();
+                            bool isCoeffOneOne = (n == 2);
+                            for (int i = 0; isCoeffOneOne && i < n; i++)
+                            {
+                                float c = paramCoeff.get<float>(i);
+                                isCoeffOneOne &= (c == 1.0f);
+                            }
+                            if (!isCoeffOneOne)
+                            {
+                                CV_LOG_DEBUG(NULL, "DNN/OpenCL: fusion of 'Sum' without coeffs (or {1.0, 1.0}) is supported only");
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        CV_LOG_DEBUG(NULL, "DNN/OpenCL: fusion with eltwise operation is not supported: " << nextData->params.get<String>("operation"));
+                        break;
+                    }
+
                     {
                         LayerData *eltwiseData = nextData;
 
@@ -2458,10 +2490,12 @@ struct Net::Impl : public detail::NetImplBase
                                     if( nextData )
                                         nextActivLayer = nextData->layerInstance.dynamicCast<ActivationLayer>();
 
-                                    if( !nextActivLayer.empty() && pinsToKeep.count(lpNext) == 0 &&
+                                    Ptr<PowerLayer> activ_power;
+                                    if( !nextActivLayer.empty() &&
                                             (!nextData->type.compare("ReLU") ||
                                              !nextData->type.compare("ChannelsPReLU") ||
-                                             !nextData->type.compare("Power")) &&
+                                             (!nextData->type.compare("Power") && (activ_power = nextActivLayer.dynamicCast<PowerLayer>()) && activ_power->scale == 1.0f)
+                                            ) &&
                                             currLayer->setActivation(nextActivLayer) )
                                     {
                                         CV_Assert_N(biasLayerData->outputBlobsWrappers.size() == 1, ld.inputBlobsWrappers.size() == 1);
@@ -2513,6 +2547,8 @@ struct Net::Impl : public detail::NetImplBase
                             }
                         }
                     }
+
+                    break;
                 }
             }
 
@@ -2525,8 +2561,7 @@ struct Net::Impl : public detail::NetImplBase
             // (and so we eliminate the concatenation layer, because the channels
             // are concatenated implicitly).
             Ptr<ConcatLayer> concatLayer = ld.layerInstance.dynamicCast<ConcatLayer>();
-            if( !concatLayer.empty() && concatLayer->axis == 1 && !concatLayer->padding &&
-                ld.outputBlobs.size() == 1 )
+            if( !concatLayer.empty() && !concatLayer->padding && ld.outputBlobs.size() == 1 )
             {
                 Mat& output = ld.outputBlobs[0];
                 UMat umat_output;
@@ -2563,7 +2598,8 @@ struct Net::Impl : public detail::NetImplBase
                 // the concatenation optimization is applied with batch_size > 1.
                 // so, for now, we only apply this optimization in the most popular
                 // case batch_size == 1.
-                if( output.dims == 4 && output.size[0] == 1 )
+                int axis = normalize_axis(concatLayer->axis, output.dims);
+                if( output.total(0, axis) == 1 )
                 {
                     size_t i, ninputs = ld.inputBlobsId.size();
                     std::vector<LayerPin> realinputs(ninputs);
@@ -2602,14 +2638,14 @@ struct Net::Impl : public detail::NetImplBase
                             OpenCLBackendWrapper::update(ld.outputBlobsWrappers, umats);
                         }
 #endif
-                        Range chrange[] = { Range::all(), Range::all(), Range::all(), Range::all() };
+                        std::vector<Range> chrange(output.dims, Range::all());
                         int ofs = 0;
                         for( i = 0; i < ninputs; i++ )
                         {
                             LayerPin pin = realinputs[i];
                             LayerData* inp_i_data = &layers[pin.lid];
-                            int channels_i = ld.inputBlobs[i]->size[1];
-                            chrange[1] = Range(ofs, ofs + channels_i);
+                            int channels_i = ld.inputBlobs[i]->size[axis];
+                            chrange[axis] = Range(ofs, ofs + channels_i);
                             printf_(("\toutput %s(%d) to channels (%d, %d)\n", inp_i_data->layerInstance->name.c_str(),
                                    pin.oid, ofs, ofs + channels_i));
                             ofs += channels_i;
@@ -2694,11 +2730,11 @@ struct Net::Impl : public detail::NetImplBase
 
         Ptr<Layer> layer = ld.layerInstance;
 
-        TickMeter tm;
-        tm.start();
-
         if( !ld.skip )
         {
+            TickMeter tm;
+            tm.start();
+
             std::map<int, Ptr<BackendNode> >::iterator it = ld.backendNodes.find(preferableBackend);
             if (preferableBackend == DNN_BACKEND_OPENCV || it == ld.backendNodes.end() || it->second.empty())
             {
@@ -2877,12 +2913,15 @@ struct Net::Impl : public detail::NetImplBase
                     CV_Error(Error::StsNotImplemented, "Unknown backend identifier");
                 }
             }
+
+            tm.stop();
+            int64 t = tm.getTimeTicks();
+            layersTimings[ld.id] = (t > 0) ? t : t + 1;  // zero for skipped layers only
         }
         else
-            tm.reset();
-
-        tm.stop();
-        layersTimings[ld.id] = tm.getTimeTicks();
+        {
+            layersTimings[ld.id] = 0;
+        }
 
         ld.flag = 1;
     }
@@ -3035,6 +3074,46 @@ struct Net::Impl : public detail::NetImplBase
         inOutShapes[0].in = netInputShapes; //insert shape for first input layer
         getLayerShapesRecursively(layerId, inOutShapes);
         shapes = inOutShapes[layerId];
+    }
+
+    void updateLayersShapes()
+    {
+        CV_Assert(!layers[0].outputBlobs.empty());
+        ShapesVec inputShapes;
+        for(int i = 0; i < layers[0].outputBlobs.size(); i++)
+        {
+            Mat& inp = layers[0].outputBlobs[i];
+            CV_Assert(inp.total());
+            if (preferableBackend == DNN_BACKEND_OPENCV &&
+                preferableTarget == DNN_TARGET_OPENCL_FP16)
+            {
+                layers[0].outputBlobs[i].create(inp.dims, inp.size, CV_16S);
+            }
+            inputShapes.push_back(shape(inp));
+        }
+        LayersShapesMap layersShapes;
+        layersShapes[0].in = inputShapes;
+        for (MapIdToLayerData::iterator it = layers.begin();
+             it != layers.end(); it++)
+        {
+            int layerId = it->first;
+            std::vector<LayerPin>& inputLayerIds = it->second.inputBlobsId;
+            if (layersShapes[layerId].in.empty())
+            {
+                for(int i = 0; i < inputLayerIds.size(); i++)
+                {
+                    int inputLayerId = inputLayerIds[i].lid;
+                    LayersShapesMap::iterator inputIt = layersShapes.find(inputLayerId);
+                    if(inputIt == layersShapes.end() || inputIt->second.out.empty())
+                    {
+                        getLayerShapesRecursively(inputLayerId, layersShapes);
+                    }
+                    const MatShape& shape = layersShapes[inputLayerId].out[inputLayerIds[i].oid];
+                    layersShapes[layerId].in.push_back(shape);
+                }
+                it->second.layerInstance->updateMemoryShapes(layersShapes[layerId].in);
+            }
+        }
     }
 
     LayerPin getLatestLayerPin(const std::vector<LayerPin>& pins)
@@ -3450,6 +3529,8 @@ int Net::addLayer(const String &name, const String &type, LayerParams &params)
     int id = ++impl->lastLayerId;
     impl->layerNameToId.insert(std::make_pair(name, id));
     impl->layers.insert(std::make_pair(id, LayerData(id, name, type, params)));
+    if (params.get<bool>("has_dynamic_shapes", false))
+        impl->hasDynamicShapes = true;
 
     return id;
 }
@@ -3486,11 +3567,16 @@ void Net::connect(String _outPin, String _inPin)
 Mat Net::forward(const String& outputName)
 {
     CV_TRACE_FUNCTION();
+    CV_Assert(!empty());
 
     String layerName = outputName;
 
     if (layerName.empty())
-        layerName = getLayerNames().back();
+    {
+        std::vector<String> layerNames = getLayerNames();
+        CV_Assert(!layerNames.empty());
+        layerName = layerNames.back();
+    }
 
     std::vector<LayerPin> pins(1, impl->getPinByAlias(layerName));
     impl->setUpNet(pins);
@@ -3502,11 +3588,17 @@ Mat Net::forward(const String& outputName)
 AsyncArray Net::forwardAsync(const String& outputName)
 {
     CV_TRACE_FUNCTION();
+    CV_Assert(!empty());
+
 #ifdef CV_CXX11
     String layerName = outputName;
 
     if (layerName.empty())
-        layerName = getLayerNames().back();
+    {
+        std::vector<String> layerNames = getLayerNames();
+        CV_Assert(!layerNames.empty());
+        layerName = layerNames.back();
+    }
 
     std::vector<LayerPin> pins(1, impl->getPinByAlias(layerName));
     impl->setUpNet(pins);
@@ -3527,11 +3619,16 @@ AsyncArray Net::forwardAsync(const String& outputName)
 void Net::forward(OutputArrayOfArrays outputBlobs, const String& outputName)
 {
     CV_TRACE_FUNCTION();
+    CV_Assert(!empty());
 
     String layerName = outputName;
 
     if (layerName.empty())
-        layerName = getLayerNames().back();
+    {
+        std::vector<String> layerNames = getLayerNames();
+        CV_Assert(!layerNames.empty());
+        layerName = layerNames.back();
+    }
 
     std::vector<LayerPin> pins(1, impl->getPinByAlias(layerName));
     impl->setUpNet(pins);
@@ -3765,8 +3862,13 @@ void Net::setInput(InputArray blob, const String& name, double scalefactor, cons
     bool oldShape = prevShape == blobShape;
 
     blob_.copyTo(impl->netInputLayer->inputsData[pin.oid]);
-    if (!oldShape)
+    if (!oldShape) {
         ld.outputBlobs[pin.oid] = impl->netInputLayer->inputsData[pin.oid];
+        if (impl->hasDynamicShapes)
+        {
+            impl->updateLayersShapes();
+        }
+    }
 
     if (!ld.outputBlobsWrappers[pin.oid].empty())
     {
@@ -4118,6 +4220,8 @@ std::vector<Ptr<Layer> > Net::getLayerInputs(LayerId layerId)
 
 std::vector<String> Net::getLayerNames() const
 {
+    CV_TRACE_FUNCTION();
+
     std::vector<String> res;
     res.reserve(impl->layers.size());
 
@@ -4691,6 +4795,10 @@ bool Layer::getMemoryShapes(const std::vector<MatShape> &inputs,
     return false;
 }
 
+bool Layer::updateMemoryShapes(const std::vector<MatShape> &inputs)
+{
+    return true;
+}
 //////////////////////////////////////////////////////////////////////////
 
 static Mutex& getLayerFactoryMutex()

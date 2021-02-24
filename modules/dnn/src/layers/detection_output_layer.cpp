@@ -54,7 +54,12 @@
 
 #ifdef HAVE_DNN_NGRAPH
 #include "../ie_ngraph.hpp"
+#if INF_ENGINE_VER_MAJOR_GT(INF_ENGINE_RELEASE_2020_4)
+#include <ngraph/op/detection_output.hpp>
+#else
 #include <ngraph/op/experimental/layers/detection_output.hpp>
+#endif
+
 #endif
 
 namespace cv
@@ -606,8 +611,13 @@ public:
                 }
             }
             // Keep outputs k results per image.
-            std::sort(scoreIndexPairs.begin(), scoreIndexPairs.end(),
-                      util::SortScorePairDescend<std::pair<int, int> >);
+            if ((_keepTopK * 8) > scoreIndexPairs.size()) {
+                std::sort(scoreIndexPairs.begin(), scoreIndexPairs.end(),
+                          util::SortScorePairDescend<std::pair<int, int> >);
+            } else {
+                std::partial_sort(scoreIndexPairs.begin(), scoreIndexPairs.begin() + _keepTopK, scoreIndexPairs.end(),
+                          util::SortScorePairDescend<std::pair<int, int> >);
+            }
             scoreIndexPairs.resize(_keepTopK);
 
             std::map<int, std::vector<int> > newIndices;
@@ -842,16 +852,16 @@ public:
         for (int i = 0; i < num; ++i, locData += numPredsPerClass * numLocClasses * 4)
         {
             LabelBBox& labelBBox = locPreds[i];
+            int start = shareLocation ? -1 : 0;
+            for (int c = 0; c < numLocClasses; ++c) {
+                labelBBox[start++].resize(numPredsPerClass);
+            }
             for (int p = 0; p < numPredsPerClass; ++p)
             {
                 int startIdx = p * numLocClasses * 4;
                 for (int c = 0; c < numLocClasses; ++c)
                 {
                     int label = shareLocation ? -1 : c;
-                    if (labelBBox.find(label) == labelBBox.end())
-                    {
-                        labelBBox[label].resize(numPredsPerClass);
-                    }
                     util::NormalizedBBox& bbox = labelBBox[label][p];
                     if (locPredTransposed)
                     {

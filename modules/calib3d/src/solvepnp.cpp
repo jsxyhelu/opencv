@@ -47,7 +47,9 @@
 #include "p3p.h"
 #include "ap3p.h"
 #include "ippe.hpp"
+#include "sqpnp.hpp"
 #include "opencv2/calib3d/calib3d_c.h"
+#include <opencv2/core/utils/logger.hpp>
 
 namespace cv
 {
@@ -750,7 +752,8 @@ int solvePnPGeneric( InputArray _opoints, InputArray _ipoints,
 
     Mat opoints = _opoints.getMat(), ipoints = _ipoints.getMat();
     int npoints = std::max(opoints.checkVector(3, CV_32F), opoints.checkVector(3, CV_64F));
-    CV_Assert( ( (npoints >= 4) || (npoints == 3 && flags == SOLVEPNP_ITERATIVE && useExtrinsicGuess) )
+    CV_Assert( ( (npoints >= 4) || (npoints == 3 && flags == SOLVEPNP_ITERATIVE && useExtrinsicGuess)
+                || (npoints >= 3 && flags == SOLVEPNP_SQPNP) )
                && npoints == std::max(ipoints.checkVector(2, CV_32F), ipoints.checkVector(2, CV_64F)) );
 
     opoints = opoints.reshape(3, npoints);
@@ -780,6 +783,15 @@ int solvePnPGeneric( InputArray _opoints, InputArray _ipoints,
     vector<Mat> vec_rvecs, vec_tvecs;
     if (flags == SOLVEPNP_EPNP || flags == SOLVEPNP_DLS || flags == SOLVEPNP_UPNP)
     {
+        if (flags == SOLVEPNP_DLS)
+        {
+            CV_LOG_DEBUG(NULL, "Broken implementation for SOLVEPNP_DLS. Fallback to EPnP.");
+        }
+        else if (flags == SOLVEPNP_UPNP)
+        {
+            CV_LOG_DEBUG(NULL, "Broken implementation for SOLVEPNP_UPNP. Fallback to EPnP.");
+        }
+
         Mat undistortedPoints;
         undistortPoints(ipoints, undistortedPoints, cameraMatrix, distCoeffs);
         epnp PnP(cameraMatrix, opoints, undistortedPoints);
@@ -926,6 +938,14 @@ int solvePnPGeneric( InputArray _opoints, InputArray _ipoints,
             }
         } catch (...) { }
     }
+    else if (flags == SOLVEPNP_SQPNP)
+    {
+        Mat undistortedPoints;
+        undistortPoints(ipoints, undistortedPoints, cameraMatrix, distCoeffs);
+
+        sqpnp::PoseSolver solver;
+        solver.solve(opoints, undistortedPoints, vec_rvecs, vec_tvecs);
+    }
     /*else if (flags == SOLVEPNP_DLS)
     {
         Mat undistortedPoints;
@@ -953,7 +973,8 @@ int solvePnPGeneric( InputArray _opoints, InputArray _ipoints,
         vec_tvecs.push_back(tvec);
     }*/
     else
-        CV_Error(CV_StsBadArg, "The flags argument must be one of SOLVEPNP_ITERATIVE, SOLVEPNP_P3P, SOLVEPNP_EPNP or SOLVEPNP_DLS");
+        CV_Error(CV_StsBadArg, "The flags argument must be one of SOLVEPNP_ITERATIVE, SOLVEPNP_P3P, "
+            "SOLVEPNP_EPNP, SOLVEPNP_DLS, SOLVEPNP_UPNP, SOLVEPNP_AP3P, SOLVEPNP_IPPE, SOLVEPNP_IPPE_SQUARE or SOLVEPNP_SQPNP");
 
     CV_Assert(vec_rvecs.size() == vec_tvecs.size());
 
